@@ -1,0 +1,8 @@
+#
+
+[[update]]
+pattern = "syncserver(.exe)?$"
+command = "strip -x $in"
+[[update]]
+pattern = "syncclient(.exe)?$"
+command = "strip -x $in"

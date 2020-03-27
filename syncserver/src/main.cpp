@@ -5,16 +5,21 @@
 #include <boost/filesystem.hpp>
 #include <boost/process.hpp>
 #include <boost/range/iterator_range.hpp>
+#include <boost/xpressive/xpressive.hpp>
 #include <connection.hpp>
+#include <cpptoml.h>
 #include <cstdio>
 #include <cxxopts.hpp>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <list>
 #include <md5.hpp>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <string>
+#include <thread>
 
 namespace
 {
@@ -24,16 +29,134 @@ namespace fs      = boost::filesystem;
 using asio::ip::tcp;
 using work_ptr = std::shared_ptr<asio::io_service::work>;
 using JSON     = nlohmann::json;
+using CPPTOML  = std::shared_ptr<cpptoml::table>;
+
+CPPTOML settings;
+
+// ファイル更新時に実行するコマンドの情報
+struct Command
+{
+  std::string            pattern_;
+  std::list<std::string> list_;
+
+  void build(std::string p, std::string l)
+  {
+    pattern_ = p;
+    boost::split(list_, l, boost::is_space());
+  }
+};
+std::vector<Command> commandList;
+
+// 実行したコマンド
+struct Execute
+{
+  using child_ptr = std::shared_ptr<boost::process::child>;
+
+  child_ptr        child_;
+  std::future<int> future_;
+
+  void run(std::string cmd)
+  {
+    child_  = std::make_shared<process::child>(cmd);
+    future_ = std::async(std::launch::async, [&]() { return 0; });
+  }
+  void wait() { child_->wait(); }
+
+  ~Execute() { wait(); }
+};
+
+// tomlからコマンド情報を作る
+void
+buildCommand(std::shared_ptr<cpptoml::table_array> table)
+{
+  if (!table)
+    return;
+
+  for (const auto& uf : *table)
+  {
+    auto pat  = uf->get_as<std::string>("pattern");
+    auto func = uf->get_as<std::string>("command");
+    if (pat && func)
+    {
+      Command cmd;
+      cmd.build(*pat, *func);
+      commandList.push_back(cmd);
+    }
+  }
+}
+
+// コマンド文字列を取得
+std::string
+getUpdateCommand(std::string path)
+{
+  using namespace boost::xpressive;
+  for (auto& cmd : commandList)
+  {
+    auto   rex = sregex::compile(cmd.pattern_);
+    smatch sm;
+    if (regex_search(path, sm, rex))
+    {
+      std::string cmdline;
+      for (const auto& l : cmd.list_)
+      {
+        if (cmdline.empty() == false)
+          cmdline += " ";
+        if (l == "$in")
+          cmdline += path;
+        else
+          cmdline += l;
+      }
+      return cmdline;
+    }
+  }
+  return {};
+}
+
+//
+
+//
+std::optional<JSON*>
+append(JSON& flist, std::string fname, std::string hash)
+{
+  for (auto& fj : flist)
+  {
+    auto n = fj["file"].get<std::string>();
+    if (n == fname)
+    {
+      // 発見
+      auto h     = fj["hash"].get<std::string>();
+      fj["hash"] = hash;
+      return h != hash ? std::optional<JSON*>{&fj} : std::nullopt;
+    }
+  }
+  // 新規
+  JSON item;
+  item["file"] = fname;
+  item["hash"] = hash;
+  flist.push_back(item);
+  return std::optional<JSON*>(&flist.back());
+}
 
 // ファイルリスト作成
 JSON
 make_filelist(std::string pathname)
 {
-  JSON           json;
   const fs::path path(pathname);
-  const fs::path jpath = path / "files.json";
+  const auto     jpath       = path / "files.json";
+  const auto     jpath_fname = jpath.generic_string();
 
-  nlohmann::json filelist;
+  JSON json, filelist;
+  {
+    // 既に存在するJSONを読む
+    std::ifstream ifs(jpath_fname);
+    if (ifs.fail() == false)
+    {
+      ifs >> json;
+      filelist = json["filelist"];
+    }
+  }
+
+  std::list<std::shared_ptr<Execute>> ex_list;
   for (const auto& e :
        boost::make_iterator_range(fs::recursive_directory_iterator(path), {}))
   {
@@ -56,17 +179,28 @@ make_filelist(std::string pathname)
           pstr   = n_path.generic_string();
         }
 
-        JSON item;
-        auto hash    = MD5::calc(pn.generic_string());
-        item["file"] = pstr;
-        item["hash"] = hash;
-        filelist.push_back(item);
+        auto hash = MD5::calc(pn.generic_string());
+        if (auto optjs = append(filelist, pstr, hash))
+        {
+          // ファイルが更新もしくは新規
+          auto cmd = getUpdateCommand(pn.generic_string());
+          if (cmd.empty() == false)
+          {
+            auto ex = std::make_shared<Execute>();
+            ex_list.push_back(ex);
+            ex->run(cmd);
+            std::cout << "command: " << cmd << std::endl;
+            auto& item   = **optjs;
+            item["hash"] = MD5::calc(pn.generic_string());
+          }
+        }
       }
     }
   }
   json["filelist"] = filelist;
+  ex_list.clear();
 
-  std::ofstream ofile(jpath.generic_string());
+  std::ofstream ofile(jpath_fname);
   ofile << std::setw(4) << json << std::endl;
   std::cout << "output json[" << jpath.generic_string() << "]" << std::endl;
 
@@ -211,6 +345,10 @@ main(int argc, char** argv)
               << "> has to be a directory." << std::endl;
     return 1;
   }
+
+  // 設定
+  settings = cpptoml::parse_file("settings.toml");
+  buildCommand(settings->get_table_array("update"));
 
   // ファイルリストのjson作成
   auto json = make_filelist(target_path.generic_string());

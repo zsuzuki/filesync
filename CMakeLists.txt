@@ -12,6 +12,7 @@ find_package(Boost 1.65.0 REQUIRED COMPONENTS thread iostreams filesystem except
 include_directories(include)
 include_directories(json/include)
 include_directories(cxxopts/include)
+include_directories(cpptoml/include)
 include_directories(${Boost_INCLUDE_DIRS})
 
 if(WIN32)
