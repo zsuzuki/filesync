@@ -98,9 +98,20 @@ public:
   }
 
   // ファイルリストリクエスト
-  void requestFileList(bool update)
+  void requestFileList(bool update, const std::vector<std::string>& fl)
   {
-    Super::send("request", {"filelist", update ? "--" : ""}, [&](bool s) {
+    Network::BufferList flist = {"filelist"};
+    if (update)
+    {
+      flist.push_back("--");
+    }
+    else
+    {
+      for (auto& f : fl)
+        flist.push_back(f);
+    }
+
+    Super::send("request", flist, [&](bool s) {
       if (!s)
       {
         is_finished_ = false;
@@ -217,11 +228,18 @@ private:
       if (fi.new_hash_ != fi.old_hash_)
       {
         // copy
-        std::cout << fi.real_path_ << ":" << fi.old_hash_ << "/" << fi.new_hash_
-                  << std::endl;
         Super::send("filereq", {fi.file_name_}, [&](bool) {
           start_receive(fi.real_path_.generic_string(), [&]() {
-            std::cout << "save to: " << fi.real_path_ << std::endl;
+            if (fi.old_hash_.empty())
+            {
+              std::cout << "create: " << fi.real_path_ << " : " << fi.new_hash_
+                        << std::endl;
+            }
+            else
+            {
+              std::cout << "update: " << fi.real_path_ << " : " << fi.old_hash_
+                        << " -> " << fi.new_hash_ << std::endl;
+            }
             asio::post([&]() { copy_loop(idx + 1); });
           });
         });
@@ -230,7 +248,7 @@ private:
       else
       {
         // through
-        std::cout << "skip: " << fi.file_name_ << std::endl;
+        // std::cout << "skip: " << fi.file_name_ << std::endl;
       }
     }
 
@@ -285,7 +303,10 @@ main(int argc, char** argv)
       cxxopts::value<std::string>()->default_value("."))(
       "d,debug",
       "Enable debugging",
-      cxxopts::value<bool>()->default_value("false"));
+      cxxopts::value<bool>()->default_value("false"))(
+      "f,file",
+      "Check files",
+      cxxopts::value<std::vector<std::string>>()->default_value({}));
 
   options.parse_positional("hostname");
 
@@ -311,7 +332,8 @@ main(int argc, char** argv)
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     readFileList(output_dir);
-    client.requestFileList(result["update"].as<bool>());
+    auto files = result["file"].as<std::vector<std::string>>();
+    client.requestFileList(result["update"].as<bool>(), files);
     // client.send(buff_list);
     while (client.isFinished() == false)
     {

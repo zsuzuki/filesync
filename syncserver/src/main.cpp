@@ -36,13 +36,24 @@ CPPTOML settings;
 // ファイル更新時に実行するコマンドの情報
 struct Command
 {
+  using sregex = boost::xpressive::sregex;
+
   std::string            pattern_;
   std::list<std::string> list_;
+  sregex                 rex_;
 
   void build(std::string p, std::string l)
   {
     pattern_ = p;
     boost::split(list_, l, boost::is_space());
+    rex_ = sregex::compile(pattern_);
+  }
+
+  bool check(std::string path)
+  {
+    using namespace boost::xpressive;
+    smatch sm;
+    return regex_search(path, sm, rex_);
   }
 };
 std::vector<Command> commandList;
@@ -54,13 +65,23 @@ struct Execute
 
   child_ptr        child_;
   std::future<int> future_;
+  fs::path         fname_;
+  JSON*            json_;
 
-  void run(std::string cmd)
+  void run(std::string cmd, fs::path fn, JSON* j)
   {
+    fname_  = fn;
     child_  = std::make_shared<process::child>(cmd);
     future_ = std::async(std::launch::async, [&]() { return 0; });
   }
-  void wait() { child_->wait(); }
+  void wait()
+  {
+    child_->wait();
+    auto& item     = *json_;
+    auto  new_hash = MD5::calc(fname_.generic_string());
+    item["hash"]   = new_hash;
+    std::cout << "update hash: " << fname_ << " -> " << new_hash << std::endl;
+  }
 
   ~Execute() { wait(); }
 };
@@ -92,9 +113,7 @@ getUpdateCommand(std::string path)
   using namespace boost::xpressive;
   for (auto& cmd : commandList)
   {
-    auto   rex = sregex::compile(cmd.pattern_);
-    smatch sm;
-    if (regex_search(path, sm, rex))
+    if (cmd.check(path))
     {
       std::string cmdline;
       for (const auto& l : cmd.list_)
@@ -111,8 +130,6 @@ getUpdateCommand(std::string path)
   }
   return {};
 }
-
-//
 
 //
 std::optional<JSON*>
@@ -139,7 +156,7 @@ append(JSON& flist, std::string fname, std::string hash)
 
 // ファイルリスト作成
 JSON
-make_filelist(std::string pathname)
+make_filelist(std::string pathname, std::vector<std::string> fnlist)
 {
   const fs::path path(pathname);
   const auto     jpath       = path / "files.json";
@@ -165,8 +182,23 @@ make_filelist(std::string pathname)
       auto& p  = e.path();
       auto  pn = p.parent_path() / p.filename();
 
+      // 調べるファイル名が指定されているならそれを確認
+      bool check = fnlist.empty();
+      if (check == false)
+      {
+        auto pfn = p.filename().generic_string();
+        for (const auto& fn : fnlist)
+        {
+          if (fn == pfn)
+          {
+            check = true;
+            break;
+          }
+        }
+      }
+
       // files.json自身は収集しない
-      if (pn != jpath)
+      if (check && pn != jpath)
       {
         auto pstr = pn.generic_string();
         auto fsp  = pstr.find(pathname);
@@ -188,10 +220,7 @@ make_filelist(std::string pathname)
           {
             auto ex = std::make_shared<Execute>();
             ex_list.push_back(ex);
-            ex->run(cmd);
-            std::cout << "command: " << cmd << std::endl;
-            auto& item   = **optjs;
-            item["hash"] = MD5::calc(pn.generic_string());
+            ex->run(cmd, pn, *optjs);
           }
         }
       }
@@ -263,10 +292,17 @@ private:
       {
         if (bufflist[0] == "filelist")
         {
-          if (bufflist.size() > 1 && bufflist[1] == "--")
+          if (bufflist.size() > 1)
           {
             // リストの更新
-            filelist_ = make_filelist(sync_dir_.generic_string());
+            std::vector<std::string> l;
+            if (bufflist[1] != "--")
+            {
+              auto st = bufflist.begin() + 1;
+              auto ed = bufflist.end();
+              l       = std::vector<std::string>(st, ed);
+            }
+            filelist_ = make_filelist(sync_dir_.generic_string(), l);
           }
           return_file_list();
         }
@@ -351,7 +387,8 @@ main(int argc, char** argv)
   buildCommand(settings->get_table_array("update"));
 
   // ファイルリストのjson作成
-  auto json = make_filelist(target_path.generic_string());
+  std::vector<std::string> e;
+  auto json = make_filelist(target_path.generic_string(), e);
 
   // サーバ起動
   for (;;)
