@@ -7,7 +7,7 @@ set(CMAKE_CXX_FLAGS "-g")
 add_compile_options("$<$<CXX_COMPILER_ID:MSVC>:/utf-8>")
 add_compile_options("$<$<CXX_COMPILER_ID:MSVC>:/EHa>")
 
-find_package(Boost 1.65.0 REQUIRED COMPONENTS thread iostreams filesystem exception)
+find_package(Boost 1.66.0 REQUIRED COMPONENTS thread iostreams filesystem exception)
 
 include_directories(include)
 include_directories(json/include)
