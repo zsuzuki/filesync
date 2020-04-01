@@ -383,8 +383,15 @@ main(int argc, char** argv)
   }
 
   // 設定
-  settings = cpptoml::parse_file("settings.toml");
-  buildCommand(settings->get_table_array("update"));
+  try
+  {
+    settings = cpptoml::parse_file("settings.toml");
+    buildCommand(settings->get_table_array("update"));
+  }
+  catch (cpptoml::parse_exception& ex)
+  {
+    std::cerr << ex.what() << std::endl;
+  }
 
   // ファイルリストのjson作成
   std::vector<std::string> e;
