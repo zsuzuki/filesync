@@ -8,19 +8,26 @@ add_compile_options("$<$<CXX_COMPILER_ID:MSVC>:/utf-8>")
 add_compile_options("$<$<CXX_COMPILER_ID:MSVC>:/EHa>")
 
 find_package(Boost 1.66.0 REQUIRED COMPONENTS thread iostreams filesystem exception)
+if(WIN32)
 find_package(lz4 CONFIG)
+else()
+link_directories(/usr/local/lib)
+endif()
 
 include_directories(include)
 include_directories(json/include)
 include_directories(cxxopts/include)
 include_directories(cpptoml/include)
 include_directories(${Boost_INCLUDE_DIRS})
-link_directories(/usr/local/lib)
 
 if(WIN32)
 set(libs
     wsock32
-    ws2_32)
+    ws2_32
+    lz4::lz4)
+else()
+set(libs
+    lz4)
 endif()
 
 project(syncclient)
@@ -29,7 +36,6 @@ add_executable(syncclient ${cli_src})
 target_link_libraries(syncclient
     PRIVATE
         ${Boost_LIBRARIES}
-        lz4
         ${libs})
 
 project(syncserver)
@@ -38,5 +44,4 @@ add_executable(syncserver ${serv_src})
 target_link_libraries(syncserver
     PRIVATE
         ${Boost_LIBRARIES}
-        lz4
         ${libs})
