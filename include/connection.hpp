@@ -35,6 +35,9 @@ class ConnectionBase
 protected:
   static constexpr size_t BLOCK_SIZE = 8 * 1024;
 
+  using ReadBlock  = std::array<char, LZ4_COMPRESSBOUND(BLOCK_SIZE)>;
+  using ReadBlocks = std::array<ReadBlock, 2>;
+
   struct Header
   {
     size_t length_;
@@ -46,12 +49,12 @@ protected:
     size_t size_;
     size_t compSize_;
     bool   eof_;
-    char   p[128 - 17];
+    char   p[128 - sizeof(size_t) * 2 - sizeof(bool)];
   };
   struct TransBuffer
   {
     TransHeader header_;
-    char        body_[BLOCK_SIZE];
+    char        body_[LZ4_COMPRESSBOUND(BLOCK_SIZE)];
   };
   struct SendInfoBase
   {
@@ -67,18 +70,18 @@ protected:
   {
     std::ifstream infile_;
     TransBuffer   buffer_;
+    ReadBlocks    read_buffer_;
+    int           read_index_;
     size_t        trans_;
-    LZ4_stream_t  lz4_stream_;
   };
   using SendInfoPtr = std::shared_ptr<SendInfoBase>;
   using SendQueue   = std::queue<SendInfoPtr>;
 
   struct ReadFileInfo
   {
-    std::string        filename_;
-    std::ofstream      ofs_;
-    RecvFileCallback   callback_;
-    LZ4_streamDecode_t lz4_stream_;
+    std::string      filename_;
+    std::ofstream    ofs_;
+    RecvFileCallback callback_;
     ReadFileInfo(std::string fn, RecvFileCallback cb)
         : filename_(fn), ofs_(fn, std::ios::binary), callback_(cb)
     {
@@ -135,8 +138,8 @@ public:
     auto& header    = info->header_;
     info->callback_ = cb;
     info->infile_.open(fname, std::ios::binary);
-    info->trans_ = fs::file_size(fname);
-    LZ4_initStream(&info->lz4_stream_, sizeof(info->lz4_stream_));
+    info->trans_      = fs::file_size(fname);
+    info->read_index_ = 0;
 
     strncpy(header.command_, "filecopy", sizeof(header.command_));
     header.length_ = info->trans_;
@@ -167,7 +170,6 @@ public:
       fs::create_directories(fullpath.parent_path());
     }
     read_file_info_ = std::make_shared<ReadFileInfo>(fname, cb);
-    LZ4_setStreamDecode(&read_file_info_->lz4_stream_, nullptr, 0);
     read_buffer_.resize(sizeof(TransBuffer));
     boost::asio::async_read(
         socket_,
@@ -242,17 +244,11 @@ private:
           socket_, asio::buffer(read_buffer_), [&](auto& err, auto bytes) {
             const TransHeader* header =
                 reinterpret_cast<const TransHeader*>(read_buffer_.data());
-            std::array<char, BLOCK_SIZE> body;
+            ReadBlock body;
             asio::read(socket_, asio::buffer(body.data(), header->compSize_));
-            std::array<char, BLOCK_SIZE> buff;
-            int                          decSize =
-                LZ4_decompress_safe_continue(&read_file_info_->lz4_stream_,
-                                             body.data(),
-                                             buff.data(),
-                                             header->compSize_,
-                                             BLOCK_SIZE);
-            // std::cout << "read body:" << header->compSize_ << "," << decSize
-            //           << std::endl;
+            ReadBlock buff;
+            int       decSize = LZ4_decompress_safe(
+                body.data(), buff.data(), header->compSize_, BLOCK_SIZE);
             auto& ofs = read_file_info_->ofs_;
             ofs.write(buff.data(), header->size_);
             if (header->eof_)
@@ -310,26 +306,21 @@ private:
     else if (auto minfo = std::dynamic_pointer_cast<SendFileInfo>(info))
     {
       // ファイル送信
-      auto& ifs    = minfo->infile_;
-      auto& buff   = minfo->buffer_;
-      auto& header = buff.header_;
-
-      std::array<char, BLOCK_SIZE> temp_buffer;
-      ifs.read(temp_buffer.data(), temp_buffer.size());
-      auto readSize    = ifs.gcount();
-      int  compSize    = LZ4_compress_fast_continue(&minfo->lz4_stream_,
-                                                temp_buffer.data(),
-                                                buff.body_,
-                                                readSize,
-                                                temp_buffer.size(),
-                                                1);
+      auto& ifs         = minfo->infile_;
+      auto& buff        = minfo->buffer_;
+      auto& header      = buff.header_;
+      int   page        = minfo->read_index_;
+      auto& temp_buffer = minfo->read_buffer_[page];
+      ifs.read(temp_buffer.data(), BLOCK_SIZE);
+      minfo->read_index_ = (minfo->read_index_ + 1) % 2;
+      auto readSize      = ifs.gcount();
+      int  compSize      = LZ4_compress_default(
+          temp_buffer.data(), buff.body_, readSize, sizeof(buff.body_));
       header.size_     = readSize;
       header.eof_      = ifs.eof();
       header.compSize_ = compSize;
       minfo->trans_ -= header.size_;
       size_t send_size = sizeof(header) + compSize;
-      // std::cout << "send size: " << send_size << ",body=" << compSize << "/"
-      //           << header.size_ << std::endl;
       asio::async_write(socket_,
                         asio::buffer(&buff, send_size),
                         [this, minfo](auto& err, auto bytes) {
