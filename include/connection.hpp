@@ -38,12 +38,17 @@ protected:
     size_t count_;
     char   command_[128];
   };
-  struct TransBuffer
+  struct TransHeader
   {
     size_t size_;
+    size_t compSize_;
     bool   eof_;
-    char   p[63];
-    char   body_[8192];
+    char   p[128 - 17];
+  };
+  struct TransBuffer
+  {
+    TransHeader header_;
+    char        body_[8192];
   };
   struct SendInfoBase
   {
@@ -190,9 +195,9 @@ private:
     {
       read_buffer_.resize(read_header_.length_);
       boost::asio::async_read(
-          socket_,
-          asio::buffer(read_buffer_.data(), read_buffer_.size()),
-          [&](auto& err, auto bytes) { on_receive(err, bytes); });
+          socket_, asio::buffer(read_buffer_), [&](auto& err, auto bytes) {
+            on_receive(err, bytes);
+          });
     }
   }
   void on_receive(const boost::system::error_code& error, size_t bytes)
@@ -224,19 +229,25 @@ private:
     }
     else
     {
-      boost::asio::async_read(
+      // パケットヘッダ
+      read_buffer_.resize(sizeof(TransHeader));
+      asio::async_read(
           socket_, asio::buffer(read_buffer_), [&](auto& err, auto bytes) {
-            const TransBuffer* tb =
-                reinterpret_cast<const TransBuffer*>(read_buffer_.data());
-            read_file_info_->ofs_.write(tb->body_, tb->size_);
-            if (tb->eof_)
+            const TransHeader* header =
+                reinterpret_cast<const TransHeader*>(read_buffer_.data());
+            std::array<char, 8 * 1024> body;
+            std::cout << "read body:" << header->size_ << std::endl;
+            asio::read(socket_, asio::buffer(body.data(), header->size_));
+            auto& ofs = read_file_info_->ofs_;
+            ofs.write(body.data(), header->size_);
+            if (header->eof_)
             {
-              read_file_info_->ofs_.close();
+              ofs.close();
               read_file_info_->callback_();
             }
             else
             {
-              // 続きがある
+              // continue
               on_file_receive(err, bytes);
             }
           });
@@ -284,17 +295,22 @@ private:
     else if (auto minfo = std::dynamic_pointer_cast<SendFileInfo>(info))
     {
       // ファイル送信
-      auto& ifs  = minfo->infile_;
-      auto& buff = minfo->buffer_;
+      auto& ifs    = minfo->infile_;
+      auto& buff   = minfo->buffer_;
+      auto& header = buff.header_;
       ifs.read(buff.body_, sizeof(buff.body_));
-      buff.size_ = ifs.gcount();
-      buff.eof_  = ifs.eof();
-      minfo->trans_ -= buff.size_;
+      header.size_     = ifs.gcount();
+      header.eof_      = ifs.eof();
+      header.compSize_ = 0;
+      minfo->trans_ -= header.size_;
+      size_t send_size = sizeof(header) + header.size_;
+      std::cout << "send size: " << send_size << ",body=" << header.size_
+                << std::endl;
       asio::async_write(socket_,
-                        asio::buffer(&buff, sizeof(buff)),
+                        asio::buffer(&buff, send_size),
                         [this, minfo](auto& err, auto bytes) {
-                          auto& b = minfo->buffer_;
-                          if (b.eof_)
+                          auto& h = minfo->buffer_.header_;
+                          if (h.eof_)
                           {
                             on_send(minfo, err, bytes);
                             std::cout << "file size: " << minfo->header_.length_
