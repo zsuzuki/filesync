@@ -165,6 +165,7 @@ main(int argc, char** argv)
       "f,filedb",
       "path to the files database",
       cxxopts::value<std::string>()->default_value("./.syncfiles.db"))(
+      "j,job", "number of jobs", cxxopts::value<int>()->default_value("-1"))(
       "s,src",
       "source files path",
       cxxopts::value<std::string>()->default_value("."))(
@@ -203,8 +204,10 @@ main(int argc, char** argv)
     }
 
     // copy thread
-    auto nb_thread = std::max(1U, std::thread::hardware_concurrency() / 2);
-    for (unsigned i = 0; i < nb_thread; i++)
+    int  njobs   = result["job"].as<int>();
+    int  maxjobs = njobs <= 0 ? std::thread::hardware_concurrency() / 2 : njobs;
+    auto nb_thread = std::max(1, maxjobs);
+    for (int i = 0; i < nb_thread; i++)
     {
       thList.emplace_back(std::thread{copyThread});
     }
