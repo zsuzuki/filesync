@@ -203,8 +203,8 @@ main(int argc, char** argv)
     }
 
     // copy thread
-    int nb_thread = std::thread::hardware_concurrency();
-    for (int i = 0; i < nb_thread - 2; i++)
+    auto nb_thread = std::max(1U, std::thread::hardware_concurrency() / 2);
+    for (unsigned i = 0; i < nb_thread; i++)
     {
       thList.emplace_back(std::thread{copyThread});
     }
