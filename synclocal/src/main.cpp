@@ -43,6 +43,7 @@ std::atomic_int         qCount{0};
 
 bool useTimeStamp = false;
 bool checkOnly    = false;
+bool verboseMode  = false;
 
 //
 struct FileInfo : public Queue
@@ -126,6 +127,8 @@ CheckInfo::check()
     // new file or update
     db->Put(leveldb::WriteOptions(), srcstr, hash);
     update = true;
+    if (update && verboseMode)
+      std::cout << "[db update]: " << srcstr << std::endl;
   }
 
   auto dstabs = srcstr;
@@ -141,6 +144,8 @@ CheckInfo::check()
   {
     // 元ファイルが更新されていない場合は先のファイルが存在するか調べる
     update = !fs::exists(dstabs);
+    if (update && verboseMode)
+      std::cout << "[no exists]: " << dstabs << std::endl;
   }
   if (update && checkOnly == false)
   {
@@ -157,6 +162,8 @@ CheckInfo::check()
   }
   else
   {
+    if (verboseMode)
+      std::cout << "[no update]: " << srcstr << std::endl;
     --qCount;
   }
 }
@@ -261,6 +268,9 @@ main(int argc, char** argv)
       "t,time",
       "check time stamp",
       cxxopts::value<bool>()->default_value("false"))(
+      "v,verbose",
+      "verbose mode",
+      cxxopts::value<bool>()->default_value("false"))(
       "c,check", "check only", cxxopts::value<bool>()->default_value("false"))(
       "p,pattern",
       "matching pattern for copy files",
@@ -315,7 +325,10 @@ main(int argc, char** argv)
     {
       useTimeStamp = result["time"].as<bool>();
       checkOnly    = result["check"].as<bool>();
-      auto ndb     = std::unique_ptr<leveldb::DB>{tdb};
+      verboseMode  = result["verbose"].as<bool>();
+      if (verboseMode)
+        std::cout << "number of job: " << nb_thread << std::endl;
+      auto ndb = std::unique_ptr<leveldb::DB>{tdb};
       db.swap(ndb);
       copyFiles(srcpath, dstpath);
     }
