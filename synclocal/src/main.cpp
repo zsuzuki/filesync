@@ -31,13 +31,15 @@ namespace fs = boost::filesystem;
 //
 struct Queue
 {
-  virtual ~Queue() = default;
+  virtual ~Queue()       = default;
+  virtual void execute() = 0;
 };
 using QueuePtr = std::shared_ptr<Queue>;
 std::queue<QueuePtr>    workList;
 std::mutex              qLock;
 std::condition_variable qCond;
-std::atomic_bool        qFinish;
+std::atomic_bool        qFinish{false};
+std::atomic_int         qCount{0};
 
 //
 struct FileInfo : public Queue
@@ -50,6 +52,22 @@ struct FileInfo : public Queue
   ~FileInfo() = default;
 
   void copy();
+  void execute() override { copy(); }
+};
+
+//
+//
+struct CheckInfo : public Queue
+{
+  fs::path    src_path_;
+  fs::path    dst_dir_;
+  std::string pathstr_;
+  size_t      pathlen_;
+
+  ~CheckInfo() = default;
+
+  void check();
+  void execute() override { check(); }
 };
 
 std::unique_ptr<leveldb::DB> db;
@@ -70,6 +88,58 @@ FileInfo::copy()
   std::cout << "[Update]: " << dpath << std::endl;
   fs::copy_file(src_path_, dst_path_, fs::copy_option::overwrite_if_exists);
   db->Put(leveldb::WriteOptions(), dpath.generic_string(), hash_);
+  --qCount;
+}
+
+//
+void
+CheckInfo::check()
+{
+  auto srcabs = src_path_;
+  auto srcstr = srcabs.generic_string();
+  auto hash   = MD5::calc(srcstr);
+
+  std::string old_hash;
+  auto        s      = db->Get(leveldb::ReadOptions(), srcstr, &old_hash);
+  bool        update = false;
+  if (!s.ok() || old_hash != hash)
+  {
+    // new file or update
+    db->Put(leveldb::WriteOptions(), srcstr, hash);
+    update = true;
+  }
+
+  auto dstabs = srcstr;
+  auto fsp    = dstabs.find(pathstr_);
+  if (fsp == 0)
+  {
+    // ディレクトリをコピー先に差し替える
+    auto     rel = dstabs.substr(pathlen_);
+    fs::path n_path{dst_dir_};
+    dstabs = (n_path / rel).generic_string();
+  }
+  if (update == false)
+  {
+    // 元ファイルが更新されていない場合は先のファイルが存在するか調べる
+    update = !fs::exists(dstabs);
+  }
+  if (update)
+  {
+    auto finfo       = std::make_shared<FileInfo>();
+    finfo->src_path_ = srcabs;
+    finfo->dst_path_ = dstabs;
+    finfo->hash_     = hash;
+    finfo->update_   = update;
+    {
+      std::lock_guard<std::mutex> l(qLock);
+      workList.push(finfo);
+    }
+    qCond.notify_one();
+  }
+  else
+  {
+    --qCount;
+  }
 }
 
 // ワーカースレッド
@@ -93,9 +163,9 @@ workThread()
         workList.pop();
       }
     }
-    if (auto finfo = std::dynamic_pointer_cast<FileInfo>(q))
+    if (q)
     {
-      finfo->copy();
+      q->execute();
     }
   }
 }
@@ -119,48 +189,30 @@ copyFiles(fs::path path, fs::path dstpath)
   {
     if (!fs::is_directory(e))
     {
-      auto srcabs = e.path();
-      auto srcstr = srcabs.generic_string();
-      auto hash   = MD5::calc(srcstr);
-
-      std::string old_hash;
-      auto        s      = db->Get(leveldb::ReadOptions(), srcstr, &old_hash);
-      bool        update = false;
-      if (!s.ok() || old_hash != hash)
+      qCount++;
+      auto chinfo       = std::make_shared<CheckInfo>();
+      chinfo->src_path_ = e.path();
+      chinfo->dst_dir_  = dstpath;
+      chinfo->pathstr_  = pathstr;
+      chinfo->pathlen_  = pathlen;
       {
-        // new file or update
-        db->Put(leveldb::WriteOptions(), srcstr, hash);
-        update = true;
+        std::lock_guard<std::mutex> l(qLock);
+        workList.push(chinfo);
       }
-
-      auto dstabs = srcstr;
-      auto fsp    = dstabs.find(pathstr);
-      if (fsp == 0)
+      qCond.notify_one();
+    }
+  }
+  //
+  for (;;)
+  {
+    {
+      std::lock_guard<std::mutex> l(qLock);
+      if (workList.empty() && qCount == 0)
       {
-        // ディレクトリをコピー先に差し替える
-        auto     rel = dstabs.substr(pathlen);
-        fs::path n_path{dstpath};
-        dstabs = (n_path / rel).generic_string();
-      }
-      if (update == false)
-      {
-        // 元ファイルが更新されていない場合は先のファイルが存在するか調べる
-        update = !fs::exists(dstabs);
-      }
-      if (update)
-      {
-        auto finfo       = std::make_shared<FileInfo>();
-        finfo->src_path_ = srcabs;
-        finfo->dst_path_ = dstabs;
-        finfo->hash_     = hash;
-        finfo->update_   = update;
-        {
-          std::lock_guard<std::mutex> l(qLock);
-          workList.push(finfo);
-        }
-        qCond.notify_one();
+        break;
       }
     }
+    std::this_thread::sleep_for(std::chrono::microseconds(0));
   }
 }
 
