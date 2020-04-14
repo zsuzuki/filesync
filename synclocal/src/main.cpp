@@ -41,6 +41,9 @@ std::condition_variable qCond;
 std::atomic_bool        qFinish{false};
 std::atomic_int         qCount{0};
 
+bool useTimeStamp = false;
+bool checkOnly    = false;
+
 //
 struct FileInfo : public Queue
 {
@@ -97,12 +100,28 @@ CheckInfo::check()
 {
   auto srcabs = src_path_;
   auto srcstr = srcabs.generic_string();
-  auto hash   = MD5::calc(srcstr);
+
+  std::string hash;
+  uint64_t    hash_num = 0;
+  if (useTimeStamp)
+  {
+    hash_num = fs::last_write_time(src_path_);
+    hash     = std::to_string(hash_num);
+  }
+  else
+  {
+    hash = MD5::calc(srcstr);
+  }
+  auto check_hash = [&](auto old) {
+    if (useTimeStamp)
+      return hash_num > std::stoull(old);
+    return hash != old;
+  };
 
   std::string old_hash;
   auto        s      = db->Get(leveldb::ReadOptions(), srcstr, &old_hash);
   bool        update = false;
-  if (!s.ok() || old_hash != hash)
+  if (!s.ok() || check_hash(old_hash))
   {
     // new file or update
     db->Put(leveldb::WriteOptions(), srcstr, hash);
@@ -123,7 +142,7 @@ CheckInfo::check()
     // 元ファイルが更新されていない場合は先のファイルが存在するか調べる
     update = !fs::exists(dstabs);
   }
-  if (update)
+  if (update && checkOnly == false)
   {
     auto finfo       = std::make_shared<FileInfo>();
     finfo->src_path_ = srcabs;
@@ -239,6 +258,10 @@ main(int argc, char** argv)
       "d,dst",
       "destination files path",
       cxxopts::value<std::string>()->default_value("."))(
+      "t,time",
+      "check time stamp",
+      cxxopts::value<bool>()->default_value("false"))(
+      "c,check", "check only", cxxopts::value<bool>()->default_value("false"))(
       "p,pattern",
       "matching pattern for copy files",
       cxxopts::value<std::string>()->default_value(""));
@@ -290,7 +313,9 @@ main(int argc, char** argv)
     }
     else
     {
-      auto ndb = std::unique_ptr<leveldb::DB>{tdb};
+      useTimeStamp = result["time"].as<bool>();
+      checkOnly    = result["check"].as<bool>();
+      auto ndb     = std::unique_ptr<leveldb::DB>{tdb};
       db.swap(ndb);
       copyFiles(srcpath, dstpath);
     }
