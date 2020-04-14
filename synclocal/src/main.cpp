@@ -29,58 +29,73 @@ namespace fs = boost::filesystem;
 //
 //
 //
-struct FileInfo
+struct Queue
+{
+  virtual ~Queue() = default;
+};
+using QueuePtr = std::shared_ptr<Queue>;
+std::queue<QueuePtr>    workList;
+std::mutex              qLock;
+std::condition_variable qCond;
+std::atomic_bool        qFinish;
+
+//
+struct FileInfo : public Queue
 {
   fs::path    src_path_;
   fs::path    dst_path_;
   std::string hash_;
   bool        update_;
+
+  ~FileInfo() = default;
+
+  void copy();
 };
-using FileInfoPtr = std::shared_ptr<FileInfo>;
-std::queue<FileInfoPtr> fileList;
-std::mutex              flLock;
-std::condition_variable flCond;
-std::atomic_bool        flFinish;
 
 std::unique_ptr<leveldb::DB> db;
 leveldb::Options             dbopts;
 
-// 実際のコピースレッド
+//
 void
-copyThread()
+FileInfo::copy()
 {
-  while (flFinish == false)
+  auto dpath = dst_path_;
+  auto dir   = dpath.parent_path();
+  if (fs::exists(dir) == false)
   {
-    FileInfoPtr finfo;
+    boost::system::error_code err;
+    fs::create_directories(dir, err);
+    // std::cout << "create directory:" << dir << std::endl;
+  }
+  std::cout << "[Update]: " << dpath << std::endl;
+  fs::copy_file(src_path_, dst_path_, fs::copy_option::overwrite_if_exists);
+  db->Put(leveldb::WriteOptions(), dpath.generic_string(), hash_);
+}
+
+// ワーカースレッド
+void
+workThread()
+{
+  while (qFinish == false)
+  {
+    QueuePtr q;
     {
-      std::unique_lock<std::mutex> l(flLock);
-      flCond.wait(l, []() { return !(fileList.empty() && flFinish == false); });
-      if (fileList.empty())
+      std::unique_lock<std::mutex> l(qLock);
+      qCond.wait(l, []() { return !(workList.empty() && qFinish == false); });
+      if (workList.empty())
       {
-        if (flFinish)
+        if (qFinish)
           break;
       }
       else
       {
-        finfo = fileList.front();
-        fileList.pop();
+        q = workList.front();
+        workList.pop();
       }
     }
-    if (finfo)
+    if (auto finfo = std::dynamic_pointer_cast<FileInfo>(q))
     {
-      auto dpath = finfo->dst_path_;
-      auto dir   = dpath.parent_path();
-      if (fs::exists(dir) == false)
-      {
-        boost::system::error_code err;
-        fs::create_directories(dir, err);
-        // std::cout << "create directory:" << dir << std::endl;
-      }
-      std::cout << "[Update]: " << dpath << std::endl;
-      fs::copy_file(finfo->src_path_,
-                    finfo->dst_path_,
-                    fs::copy_option::overwrite_if_exists);
-      db->Put(leveldb::WriteOptions(), dpath.generic_string(), finfo->hash_);
+      finfo->copy();
     }
   }
 }
@@ -140,10 +155,10 @@ copyFiles(fs::path path, fs::path dstpath)
         finfo->hash_     = hash;
         finfo->update_   = update;
         {
-          std::lock_guard<std::mutex> l(flLock);
-          fileList.emplace(finfo);
+          std::lock_guard<std::mutex> l(qLock);
+          workList.push(finfo);
         }
-        flCond.notify_one();
+        qCond.notify_one();
       }
     }
   }
@@ -209,7 +224,7 @@ main(int argc, char** argv)
     auto nb_thread = std::max(1, maxjobs);
     for (int i = 0; i < nb_thread; i++)
     {
-      thList.emplace_back(std::thread{copyThread});
+      thList.emplace_back(std::thread{workThread});
     }
 
     // source db open
@@ -236,8 +251,8 @@ main(int argc, char** argv)
     ret = 1;
   }
   //
-  flFinish = true;
-  flCond.notify_all();
+  qFinish = true;
+  qCond.notify_all();
   for (auto& th : thList)
   {
     th.join();
