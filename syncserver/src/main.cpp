@@ -7,7 +7,6 @@
 #include <boost/range/iterator_range.hpp>
 #include <boost/xpressive/xpressive.hpp>
 #include <connection.hpp>
-#include <cpptoml.h>
 #include <cstdio>
 #include <cxxopts.hpp>
 #include <fstream>
@@ -15,8 +14,6 @@
 #include <iostream>
 #include <iterator>
 #include <list>
-#include <md5.hpp>
-#include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
 #include <thread>
@@ -28,212 +25,67 @@ namespace process = boost::process;
 namespace fs      = boost::filesystem;
 using asio::ip::tcp;
 using work_ptr = std::shared_ptr<asio::io_service::work>;
-using JSON     = nlohmann::json;
-using CPPTOML  = std::shared_ptr<cpptoml::table>;
 
-CPPTOML settings;
+bool verboseMode = false;
 
-// ファイル更新時に実行するコマンドの情報
-struct Command
+// ファイル情報
+struct FileInfo
 {
-  using sregex = boost::xpressive::sregex;
-
-  std::string            pattern_;
-  std::list<std::string> list_;
-  sregex                 rex_;
-
-  void build(std::string p, std::string l)
-  {
-    pattern_ = p;
-    boost::split(list_, l, boost::is_space());
-    rex_ = sregex::compile(pattern_);
-  }
-
-  bool check(std::string path)
-  {
-    using namespace boost::xpressive;
-    smatch sm;
-    return regex_search(path, sm, rex_);
-  }
+  fs::path    full_path_;
+  fs::path    rel_path_;
+  std::string time_;
 };
-std::vector<Command> commandList;
-
-// 実行したコマンド
-struct Execute
-{
-  using child_ptr = std::shared_ptr<boost::process::child>;
-
-  child_ptr        child_;
-  std::future<int> future_;
-  fs::path         fname_;
-  JSON*            json_;
-
-  void run(std::string cmd, fs::path fn, JSON* j)
-  {
-    fname_  = fn;
-    child_  = std::make_shared<process::child>(cmd);
-    future_ = std::async(std::launch::async, [&]() { return 0; });
-  }
-  void wait()
-  {
-    child_->wait();
-    auto& item     = *json_;
-    auto  new_hash = MD5::calc(fname_.generic_string());
-    item["hash"]   = new_hash;
-    std::cout << "update hash: " << fname_ << " -> " << new_hash << std::endl;
-  }
-
-  ~Execute() { wait(); }
-};
-
-// tomlからコマンド情報を作る
-void
-buildCommand(std::shared_ptr<cpptoml::table_array> table)
-{
-  if (!table)
-    return;
-
-  for (const auto& uf : *table)
-  {
-    auto pat  = uf->get_as<std::string>("pattern");
-    auto func = uf->get_as<std::string>("command");
-    if (pat && func)
-    {
-      Command cmd;
-      cmd.build(*pat, *func);
-      commandList.push_back(cmd);
-    }
-  }
-}
-
-// コマンド文字列を取得
-std::string
-getUpdateCommand(std::string path)
-{
-  using namespace boost::xpressive;
-  for (auto& cmd : commandList)
-  {
-    if (cmd.check(path))
-    {
-      std::string cmdline;
-      for (const auto& l : cmd.list_)
-      {
-        if (cmdline.empty() == false)
-          cmdline += " ";
-        if (l == "$in")
-          cmdline += path;
-        else
-          cmdline += l;
-      }
-      return cmdline;
-    }
-  }
-  return {};
-}
-
-//
-std::optional<JSON*>
-append(JSON& flist, std::string fname, std::string hash)
-{
-  for (auto& fj : flist)
-  {
-    auto n = fj["file"].get<std::string>();
-    if (n == fname)
-    {
-      // 発見
-      auto h     = fj["hash"].get<std::string>();
-      fj["hash"] = hash;
-      return h != hash ? std::optional<JSON*>{&fj} : std::nullopt;
-    }
-  }
-  // 新規
-  JSON item;
-  item["file"] = fname;
-  item["hash"] = hash;
-  flist.push_back(item);
-  return std::optional<JSON*>(&flist.back());
-}
+using FileList = std::list<FileInfo>;
+FileList transFileList;
 
 // ファイルリスト作成
-JSON
-make_filelist(std::string pathname, std::vector<std::string> fnlist)
+FileList
+makeFilelist(const fs::path path, std::string without)
 {
-  const fs::path path(pathname);
-  const auto     jpath       = path / "files.json";
-  const auto     jpath_fname = jpath.generic_string();
+  using sregex  = boost::xpressive::sregex;
+  sregex rex    = sregex::compile(without);
+  bool   no_rex = without.empty();
 
-  JSON json, filelist;
+  FileList tflist;
+  if (verboseMode)
   {
-    // 既に存在するJSONを読む
-    std::ifstream ifs(jpath_fname);
-    if (ifs.fail() == false)
-    {
-      ifs >> json;
-      filelist = json["filelist"];
-    }
+    std::cout << "Search Path: " << path << std::endl;
   }
 
-  std::list<std::shared_ptr<Execute>> ex_list;
-  for (const auto& e :
-       boost::make_iterator_range(fs::recursive_directory_iterator(path), {}))
+  auto it   = fs::recursive_directory_iterator(path);
+  auto dir  = boost::make_iterator_range(it, {});
+  auto rstr = path.generic_string();
+  auto rlen = rstr.length();
+  for (const auto& e : dir)
   {
     if (!fs::is_directory(e))
     {
-      auto& p  = e.path();
-      auto  pn = p.parent_path() / p.filename();
-
-      // 調べるファイル名が指定されているならそれを確認
-      bool check = fnlist.empty();
-      if (check == false)
+      using namespace boost::xpressive;
+      auto   fname = e.path();
+      smatch sm;
+      if (no_rex || !regex_search(fname.generic_string(), sm, rex))
       {
-        auto pfn = p.filename().generic_string();
-        for (const auto& fn : fnlist)
+        // 除外パターンに掛からなかったので通過
+        auto pstr    = fname.generic_string();
+        auto len     = pstr[rlen] == '/' ? rlen + 1 : rlen;
+        auto relpath = pstr.substr(len);
+        auto wtime   = fs::last_write_time(fname);
+        auto wtstr   = std::to_string(wtime);
+        //
+        FileInfo fi;
+        fi.full_path_ = fname;
+        fi.rel_path_  = relpath;
+        fi.time_      = wtstr;
+        tflist.push_back(fi);
+        if (verboseMode)
         {
-          if (fn == pfn)
-          {
-            check = true;
-            break;
-          }
-        }
-      }
-
-      // files.json自身は収集しない
-      if (check && pn != jpath)
-      {
-        auto pstr = pn.generic_string();
-        auto fsp  = pstr.find(pathname);
-        if (fsp == 0)
-        {
-          // 先頭からpathname分を削る
-          auto     rel = pstr.substr(pathname.length());
-          fs::path n_path(".");
-          n_path = (n_path / rel).lexically_normal();
-          pstr   = n_path.generic_string();
-        }
-
-        auto hash = MD5::calc(pn.generic_string());
-        if (auto optjs = append(filelist, pstr, hash))
-        {
-          // ファイルが更新もしくは新規
-          auto cmd = getUpdateCommand(pn.generic_string());
-          if (cmd.empty() == false)
-          {
-            auto ex = std::make_shared<Execute>();
-            ex_list.push_back(ex);
-            ex->run(cmd, pn, *optjs);
-          }
+          std::cout << "Append: " << fname << "(" << relpath << "): " << wtstr
+                    << std::endl;
         }
       }
     }
   }
-  json["filelist"] = filelist;
-  ex_list.clear();
-
-  std::ofstream ofile(jpath_fname);
-  ofile << std::setw(4) << json << std::endl;
-  std::cout << "output json[" << jpath.generic_string() << "]" << std::endl;
-
-  return json;
+  return tflist;
 }
 
 //
@@ -243,8 +95,8 @@ class Server : public Network::ConnectionBase
 {
   tcp::acceptor acceptor_;
   work_ptr      work_;
-  JSON          filelist_;
-  fs::path      sync_dir_;
+  fs::path      req_dir_;
+  FileList      filelist_;
 
 public:
   Server(asio::io_service& io_service)
@@ -254,12 +106,7 @@ public:
   {
   }
 
-  void start(JSON& json, const fs::path& sdir)
-  {
-    filelist_ = json;
-    sync_dir_ = sdir;
-    start_accept();
-  }
+  void start() { start_accept(); }
 
 private:
   // 接続待機
@@ -292,17 +139,23 @@ private:
       {
         if (bufflist[0] == "filelist")
         {
+          fs::path    source_path{"."};
+          std::string without_regex;
           if (bufflist.size() > 1)
           {
-            // リストの更新
-            std::vector<std::string> l;
-            if (bufflist[1] != "--")
+            source_path = bufflist[1];
+            if (bufflist.size() > 2)
             {
-              auto st = bufflist.begin() + 1;
-              auto ed = bufflist.end();
-              l       = std::vector<std::string>(st, ed);
+              without_regex = bufflist[2];
             }
-            filelist_ = make_filelist(sync_dir_.generic_string(), l);
+            if (verboseMode)
+            {
+              std::cout << "Source Path: " << source_path << std::endl;
+              std::cout << "Without Regex: " << without_regex << std::endl;
+            }
+            // リストの更新
+            req_dir_  = source_path.lexically_normal();
+            filelist_ = makeFilelist(req_dir_, without_regex);
           }
           return_file_list();
         }
@@ -313,7 +166,7 @@ private:
       else if (command == "filereq")
       {
         // ファイルを送り返す
-        fs::path fname = (sync_dir_ / bufflist[0]).lexically_normal();
+        fs::path fname = (req_dir_ / bufflist[0]).lexically_normal();
         std::cout << "request: " << fname << std::endl;
         sendFile(fname.generic_string(), [&](bool s) {
           //
@@ -335,11 +188,10 @@ private:
     try
     {
       Network::BufferList send_fl;
-      auto                fl = filelist_["filelist"];
-      for (auto& f : fl)
+      for (auto& f : filelist_)
       {
-        send_fl.push_back(f["file"].get<std::string>());
-        send_fl.push_back(f["hash"].get<std::string>());
+        send_fl.push_back(f.rel_path_.generic_string());
+        send_fl.push_back(f.time_);
       }
       send("filelist", send_fl, [&](bool) {});
     }
@@ -360,11 +212,8 @@ main(int argc, char** argv)
                            "directory synchronize server");
 
   options.add_options()("h,help", "Print usage")(
-      "p,path",
-      "Search path",
-      cxxopts::value<std::string>()->default_value("."))(
-      "d,debug",
-      "Enable debugging",
+      "v,verbose",
+      "verbose mode",
       cxxopts::value<bool>()->default_value("false"));
 
   auto result = options.parse(argc, argv);
@@ -374,36 +223,19 @@ main(int argc, char** argv)
     return 0;
   }
 
-  const fs::path target_path(result["path"].as<std::string>());
-  if (fs::is_directory(target_path) == false)
-  {
-    std::cerr << "\"PATH\"<" << target_path.generic_string()
-              << "> has to be a directory." << std::endl;
-    return 1;
-  }
-
-  // 設定
-  try
-  {
-    settings = cpptoml::parse_file("settings.toml");
-    buildCommand(settings->get_table_array("update"));
-  }
-  catch (cpptoml::parse_exception& ex)
-  {
-    std::cerr << ex.what() << std::endl;
-  }
-
-  // ファイルリストのjson作成
-  std::vector<std::string> e;
-  auto json = make_filelist(target_path.generic_string(), e);
+  verboseMode = result["verbose"].as<bool>();
 
   // サーバ起動
   for (;;)
   {
+    if (verboseMode)
+      std::cout << "Server launch(waiting...)" << std::endl;
     asio::io_service io_service;
     Server           server(io_service);
-    server.start(json, target_path);
+    server.start();
     io_service.run();
+    if (verboseMode)
+      std::cout << "transfer done." << std::endl;
   }
 
   return 0;

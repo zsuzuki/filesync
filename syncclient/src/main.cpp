@@ -27,6 +27,8 @@ namespace fs   = boost::filesystem;
 using asio::ip::tcp;
 using JSON = nlohmann::json;
 
+bool verboseMode = false;
+
 //
 //
 //
@@ -43,32 +45,6 @@ struct FileInfo
 };
 
 std::vector<FileInfo> fileList;
-
-void
-readFileList(std::string outdir)
-{
-  fs::path json_path{outdir};
-  json_path /= "files.json";
-  if (fs::exists(json_path))
-  {
-    std::ifstream jfile{json_path.generic_string()};
-    JSON          json;
-    jfile >> json;
-
-    JSON fj = json["filelist"];
-    for (auto& f : fj)
-    {
-      FileInfo fi;
-      fs::path rp{outdir};
-      fi.file_name_ = f["file"];
-      fi.real_path_ = rp / fi.file_name_;
-      fi.old_hash_  = f["hash"];
-      fi.new_hash_  = fi.old_hash_;
-      fi.exists_    = true;
-      fileList.push_back(fi);
-    }
-  }
-}
 
 //
 //
@@ -98,18 +74,11 @@ public:
   }
 
   // ファイルリストリクエスト
-  void requestFileList(bool update, const std::vector<std::string>& fl)
+  void requestFileList(const std::vector<std::string>& cmd)
   {
     Network::BufferList flist = {"filelist"};
-    if (update)
-    {
-      flist.push_back("--");
-    }
-    else
-    {
-      for (auto& f : fl)
-        flist.push_back(f);
-    }
+    for (auto& f : cmd)
+      flist.push_back(f);
 
     Super::send("request", flist, [&](bool s) {
       if (!s)
@@ -175,31 +144,24 @@ private:
         {
           for (size_t i = 0; i < buff.size(); i += 2)
           {
-            auto fname = buff[i];
-            auto rpath = (output_dir_ / fname).lexically_normal();
-            auto hash  = i + 1 < buff.size() ? buff[i + 1] : "";
-            auto it    = std::find(fileList.begin(), fileList.end(), fname);
-            if (it != fileList.end())
+            auto fname   = buff[i];
+            auto rpath   = (output_dir_ / fname).lexically_normal();
+            auto timestr = i + 1 < buff.size() ? buff[i + 1] : "";
+            auto wtime   = std::stoull(timestr);
+
+            time_t uptime = 0;
+            if (fs::exists(rpath))
             {
-              // リストにある
-              auto& fi      = *it;
-              fi.new_hash_  = hash;
-              fi.real_path_ = rpath;
-              if (fs::exists(rpath) == false)
-              {
-                // ファイルが消されている
-                fi.old_hash_ = "";
-              }
+              // ファイルがあるなら更新時刻を取得
+              uptime = fs::last_write_time(rpath);
             }
-            else
+
+            if (wtime > uptime)
             {
-              // new file
+              // サーバの方が新しい=更新
               FileInfo nf;
               nf.file_name_ = fname;
               nf.real_path_ = rpath;
-              nf.old_hash_  = "";
-              nf.new_hash_  = hash;
-              nf.exists_    = true;
               fileList.push_back(nf);
             }
           }
@@ -225,59 +187,30 @@ private:
     for (; idx < fileList.size(); idx++)
     {
       auto& fi = fileList[idx];
-      if (fi.new_hash_ != fi.old_hash_)
-      {
-        // copy
-        Super::send("filereq", {fi.file_name_}, [&](bool) {
-          start_receive(fi.real_path_.generic_string(), [&]() {
-            if (fi.old_hash_.empty())
-            {
-              std::cout << "create: " << fi.real_path_ << " : " << fi.new_hash_
-                        << std::endl;
-            }
-            else
-            {
-              std::cout << "update: " << fi.real_path_ << " : " << fi.old_hash_
-                        << " -> " << fi.new_hash_ << std::endl;
-            }
-            asio::post([&]() { copy_loop(idx + 1); });
-          });
+      Super::send("filereq", {fi.file_name_}, [&](bool) {
+        start_receive(fi.real_path_.generic_string(), [&]() {
+          if (fi.old_hash_.empty())
+          {
+            std::cout << "create: " << fi.real_path_ << " : " << fi.new_hash_
+                      << std::endl;
+          }
+          else
+          {
+            std::cout << "update: " << fi.real_path_ << " : " << fi.old_hash_
+                      << " -> " << fi.new_hash_ << std::endl;
+          }
+          asio::post([&]() { copy_loop(idx + 1); });
         });
-        break;
-      }
-      else
-      {
-        // through
-        // std::cout << "skip: " << fi.file_name_ << std::endl;
-      }
+      });
+      break;
     }
 
     if (idx >= fileList.size())
     {
       // 全転送完了
-      save_json();
       Super::send("finish", {"no error"}, [&](bool) {});
       is_finished_ = true;
     }
-  }
-
-  //
-  void save_json()
-  {
-    JSON json;
-    JSON fl;
-    for (auto& fi : fileList)
-    {
-      JSON fj;
-      fj["file"] = fi.file_name_;
-      fj["hash"] = fi.new_hash_;
-      fl.push_back(fj);
-    }
-    json["filelist"] = fl;
-
-    fs::path      json_path = (output_dir_ / "files.json").lexically_normal();
-    std::ofstream jfile{json_path.generic_string()};
-    jfile << std::setw(4) << json;
   }
 };
 
@@ -292,21 +225,21 @@ main(int argc, char** argv)
                            "directory synchronize client");
 
   options.add_options()("h,help", "Print usage")(
-      "u,update",
-      "Update files",
-      cxxopts::value<bool>()->default_value("false"))(
       "hostname",
       "Hostname",
       cxxopts::value<std::string>()->default_value("localhost"))(
       "o,output",
       "Output path",
       cxxopts::value<std::string>()->default_value("."))(
-      "d,debug",
-      "Enable debugging",
-      cxxopts::value<bool>()->default_value("false"))(
-      "f,file",
-      "Check files",
-      cxxopts::value<std::vector<std::string>>()->default_value({}));
+      "r,request",
+      "request directory",
+      cxxopts::value<std::string>()->default_value("."))(
+      "w,without",
+      "without pattern",
+      cxxopts::value<std::string>()->default_value(""))(
+      "v,verbose",
+      "verbose mode",
+      cxxopts::value<bool>()->default_value("false"));
 
   options.parse_positional("hostname");
 
@@ -321,20 +254,25 @@ main(int argc, char** argv)
       return 0;
     }
 
+    verboseMode = result["verbose"].as<bool>();
+
     asio::io_service io_service;
     Client           client(io_service);
     auto             output_dir = result["output"].as<std::string>();
     auto             w  = std::make_shared<asio::io_service::work>(io_service);
     auto             th = std::thread([&]() { io_service.run(); });
+    // 接続
     client.start(hostname, output_dir);
     while (client.isConnect() == false)
     {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    readFileList(output_dir);
-    auto files = result["file"].as<std::vector<std::string>>();
-    client.requestFileList(result["update"].as<bool>(), files);
-    // client.send(buff_list);
+    // 要求(まずはファイルリストから)
+    Network::BufferList req;
+    req.push_back(result["request"].as<std::string>());
+    req.push_back(result["without"].as<std::string>());
+    client.requestFileList(req);
+    // 転送待ち
     while (client.isFinished() == false)
     {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));

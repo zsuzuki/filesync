@@ -90,7 +90,8 @@ FileInfo::copy()
     // std::cout << "create directory:" << dir << std::endl;
   }
   std::cout << "[Update]: " << dpath << std::endl;
-  fs::copy_file(src_path_, dst_path_, fs::copy_option::overwrite_if_exists);
+  fs::remove(dst_path_);
+  fs::copy_file(src_path_, dst_path_);
   db->Put(leveldb::WriteOptions(), dpath.generic_string(), hash_);
   --qCount;
 }
